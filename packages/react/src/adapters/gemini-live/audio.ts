@@ -1,3 +1,5 @@
+import { raceWithAbortSignal } from "@assistant-ui/core/internal";
+
 export const encodePcm16 = (samples: Float32Array): string => {
   const bytes = new Uint8Array(samples.length * 2);
   const view = new DataView(bytes.buffer);
@@ -101,24 +103,40 @@ export const openMicrophone = async (options: {
   onChunk: (base64: string) => void;
   signal?: AbortSignal;
 }): Promise<MicrophoneCapture> => {
-  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-  const stopTracks = () => stream.getTracks().forEach((track) => track.stop());
+  let stream: MediaStream | undefined;
+  const stopTracks = () => {
+    stream?.getTracks().forEach((track) => track.stop());
+    stream = undefined;
+  };
   const throwIfAborted = () => {
     if (options.signal?.aborted) throw options.signal.reason;
   };
   let context: AudioContext | undefined;
   try {
+    const openedStream = await raceWithAbortSignal(options.signal, async () => {
+      const acquired = await navigator.mediaDevices.getUserMedia({
+        audio: true,
+      });
+      stream = acquired;
+      if (options.signal?.aborted) {
+        stopTracks();
+        throw options.signal.reason;
+      }
+      return acquired;
+    });
     throwIfAborted();
     context = new AudioContext();
-    if (context.state === "suspended") await context.resume();
+    if (context.state === "suspended")
+      await raceWithAbortSignal(options.signal, () => context!.resume());
     throwIfAborted();
-    const source = context.createMediaStreamSource(stream);
+    const source = context.createMediaStreamSource(openedStream);
     const analyser = context.createAnalyser();
     analyser.fftSize = 256;
     source.connect(analyser);
 
     let muted = false;
     let closed = false;
+    let closing: Promise<void> | undefined;
     const push = (samples: Float32Array) => {
       if (!muted && !closed && samples.length)
         options.onChunk(encodePcm16(samples));
@@ -131,7 +149,9 @@ export const openMicrophone = async (options: {
         new Blob([WORKLET_SOURCE], { type: "text/javascript" }),
       );
       try {
-        await context.audioWorklet.addModule(url);
+        await raceWithAbortSignal(options.signal, () =>
+          context!.audioWorklet.addModule(url),
+        );
         throwIfAborted();
         const worklet = new AudioWorkletNode(context, "pcm-capture", {
           processorOptions: { targetRate: options.sampleRate },
@@ -150,7 +170,7 @@ export const openMicrophone = async (options: {
     }
     if (!node) {
       const resample = createResampler(context.sampleRate / options.sampleRate);
-      const processor = context.createScriptProcessor(2048, 1, 1);
+      const processor = context.createScriptProcessor(1024, 1, 1);
       processor.onaudioprocess = (event) =>
         push(resample(event.inputBuffer.getChannelData(0)));
       detach = () => {
@@ -165,18 +185,19 @@ export const openMicrophone = async (options: {
     return {
       setMuted: (value) => {
         muted = value;
-        stream.getAudioTracks().forEach((track) => {
+        openedStream.getAudioTracks().forEach((track) => {
           track.enabled = !value;
         });
       },
       level: () => readLevel(analyser),
-      close: async () => {
+      close: () => {
+        if (closing) return closing;
         closed = true;
         detach();
         node.disconnect();
         source.disconnect();
         stopTracks();
-        await opened.close();
+        return (closing = opened.close());
       },
     };
   } catch (error) {
@@ -206,6 +227,7 @@ export const createPcmPlayer = (options: {
   analyser.connect(context.destination);
   const sources = new Set<AudioBufferSourceNode>();
   let cursor = 0;
+  let closing: Promise<void> | undefined;
   let idleTimer: ReturnType<typeof setTimeout> | undefined;
   const scheduleIdle = () => {
     clearTimeout(idleTimer);
@@ -249,14 +271,15 @@ export const createPcmPlayer = (options: {
     },
     isPlaying: () => sources.size > 0,
     level: () => readLevel(analyser),
-    close: async () => {
+    close: () => {
+      if (closing) return closing;
       clearTimeout(idleTimer);
       for (const source of sources) {
         source.onended = null;
         source.stop();
       }
       sources.clear();
-      await context.close();
+      return (closing = context.close());
     },
   };
 };

@@ -61,7 +61,10 @@ class FakeContext {
   }
   createAnalyser = vi.fn(() => this.analyser);
   createMediaStreamSource = vi.fn(() => this.mediaSource);
-  createScriptProcessor = vi.fn(() => this.processor);
+  createScriptProcessor = vi.fn(
+    (_bufferSize: number, _inputChannels: number, _outputChannels: number) =>
+      this.processor,
+  );
   createBuffer = vi.fn((_channels: number, length: number, rate: number) => ({
     duration: length / rate,
     copyToChannel: vi.fn(),
@@ -72,7 +75,14 @@ class FakeContext {
     return source;
   });
   resume: () => Promise<void> = vi.fn(async () => {});
-  close = vi.fn(async () => {});
+  close = vi.fn(async () => {
+    if (this.state === "closed")
+      throw new DOMException(
+        "AudioContext is already closed",
+        "InvalidStateError",
+      );
+    this.state = "closed";
+  });
 }
 
 const installBrowser = () => {
@@ -289,7 +299,7 @@ describe("microphone", () => {
     const onChunk = vi.fn();
     await openMicrophone({ sampleRate: 16000, onChunk });
     const context = FakeContext.instances[0]!;
-    expect(context.createScriptProcessor).toHaveBeenCalledWith(2048, 1, 1);
+    expect(context.createScriptProcessor).toHaveBeenCalledWith(1024, 1, 1);
     const samples = Float32Array.from([0, 0.3, 0.6, 0.9, 1.2, 1.5]);
     context.processor.onaudioprocess?.({
       inputBuffer: { getChannelData: () => samples },
@@ -298,23 +308,39 @@ describe("microphone", () => {
     expect(FakeWorklet.instances).toHaveLength(0);
   });
 
-  it("keeps the fallback sample rate across buffers", async () => {
-    FakeContext.workletSupported = false;
-    installBrowser();
-    const onChunk = vi.fn();
-    await openMicrophone({ sampleRate: 16000, onChunk });
-    const context = FakeContext.instances[0]!;
-    for (const start of [0, 2048])
-      context.processor.onaudioprocess?.({
-        inputBuffer: { getChannelData: () => ramp(start, 2048, 1 / 8192) },
-      });
-    const out = onChunk.mock.calls.flatMap(([base64]) => [
-      ...decodePcm16(base64 as string),
-    ]);
-    expect(out).toHaveLength(1365);
-    for (const [k, value] of out.entries())
-      expect(Math.abs(value - (k * 3) / 8192)).toBeLessThan(1 / 16384);
-  });
+  it.each([
+    [48000, 3, 683],
+    [44100, 2.75625, 743],
+  ])(
+    "keeps fallback chunks below 25 ms at %i Hz without losing samples",
+    async (rate, ratio, count) => {
+      FakeContext.workletSupported = false;
+      installBrowser();
+      vi.stubGlobal(
+        "AudioContext",
+        class extends FakeContext {
+          constructor() {
+            super({ sampleRate: rate });
+          }
+        },
+      );
+      const onChunk = vi.fn();
+      await openMicrophone({ sampleRate: 16000, onChunk });
+      const context = FakeContext.instances[0]!;
+      const size = context.createScriptProcessor.mock.calls[0]![0];
+      expect(size / rate).toBeLessThan(0.025);
+      for (const start of [0, size])
+        context.processor.onaudioprocess?.({
+          inputBuffer: { getChannelData: () => ramp(start, size, 1 / 8192) },
+        });
+      const out = onChunk.mock.calls.flatMap(([base64]) => [
+        ...decodePcm16(base64 as string),
+      ]);
+      expect(out).toHaveLength(count);
+      for (const [k, value] of out.entries())
+        expect(Math.abs(value - (k * ratio) / 8192)).toBeLessThan(1 / 16384);
+    },
+  );
 
   it("captures with the fallback when the worklet module is blocked", async () => {
     FakeContext.addModule = async () => {
@@ -444,7 +470,7 @@ describe("microphone", () => {
     expect(context.close).toHaveBeenCalled();
   });
 
-  it("stops the tracks and rejects when already aborted", async () => {
+  it("rejects without requesting permission when already aborted", async () => {
     const browser = installBrowser();
     const controller = new AbortController();
     controller.abort(new Error("cancelled"));
@@ -455,9 +481,160 @@ describe("microphone", () => {
         signal: controller.signal,
       }),
     ).rejects.toThrow("cancelled");
-    expect(browser.track.stop).toHaveBeenCalled();
+    expect(browser.getUserMedia).not.toHaveBeenCalled();
     expect(FakeContext.instances).toHaveLength(0);
   });
+
+  it.each(["granted", "denied"])(
+    "cancels a pending permission request before it is %s",
+    async (permission) => {
+      const browser = installBrowser();
+      let grant!: (
+        stream: Awaited<ReturnType<typeof browser.getUserMedia>>,
+      ) => void;
+      let deny!: (reason: unknown) => void;
+      browser.getUserMedia.mockReturnValue(
+        new Promise((resolve, reject) => {
+          grant = resolve;
+          deny = reject;
+        }),
+      );
+      const controller = new AbortController();
+      const onError = vi.fn();
+      const opening = openMicrophone({
+        sampleRate: 16000,
+        onChunk: () => {},
+        signal: controller.signal,
+      }).catch(onError);
+      const reason = new Error("cancelled");
+      controller.abort(reason);
+      try {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        expect(onError).toHaveBeenCalledWith(reason);
+        expect(FakeContext.instances).toHaveLength(0);
+      } finally {
+        if (permission === "granted")
+          grant({
+            getTracks: () => [browser.track],
+            getAudioTracks: () => [browser.track],
+          });
+        else deny(new DOMException("Permission denied", "NotAllowedError"));
+        await opening;
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+      expect(onError).toHaveBeenCalledTimes(1);
+      expect(browser.track.stop).toHaveBeenCalledTimes(
+        permission === "granted" ? 1 : 0,
+      );
+      expect(FakeContext.instances).toHaveLength(0);
+    },
+  );
+
+  it("shares pending microphone cleanup across repeated close calls", async () => {
+    const browser = installBrowser();
+    const microphone = await openMicrophone({
+      sampleRate: 16000,
+      onChunk: () => {},
+    });
+    const context = FakeContext.instances[0]!;
+    let finishClose!: () => void;
+    context.close.mockImplementation(() => {
+      if (context.state === "closed")
+        return Promise.reject(
+          new DOMException("Already closed", "InvalidStateError"),
+        );
+      context.state = "closed";
+      return new Promise<void>((resolve) => {
+        finishClose = resolve;
+      });
+    });
+    const settled = vi.fn();
+    const first = microphone.close().then(settled);
+    const second = microphone.close().then(settled);
+    const both = Promise.allSettled([first, second]);
+    await Promise.resolve();
+    expect(settled).not.toHaveBeenCalled();
+    finishClose();
+    expect(await both).toEqual([
+      { status: "fulfilled", value: undefined },
+      { status: "fulfilled", value: undefined },
+    ]);
+    await expect(microphone.close()).resolves.toBeUndefined();
+    expect(context.close).toHaveBeenCalledTimes(1);
+    expect(browser.track.stop).toHaveBeenCalledTimes(1);
+  });
+
+  it("releases a stream when cancellation wins just after permission resolves", async () => {
+    const browser = installBrowser();
+    let grant!: (
+      stream: Awaited<ReturnType<typeof browser.getUserMedia>>,
+    ) => void;
+    browser.getUserMedia.mockReturnValue(
+      new Promise((resolve) => {
+        grant = resolve;
+      }),
+    );
+    const controller = new AbortController();
+    const opening = openMicrophone({
+      sampleRate: 16000,
+      onChunk: () => {},
+      signal: controller.signal,
+    });
+    const reason = new Error("cancelled");
+    grant({
+      getTracks: () => [browser.track],
+      getAudioTracks: () => [browser.track],
+    });
+    queueMicrotask(() => controller.abort(reason));
+    await expect(opening).rejects.toBe(reason);
+    expect(browser.track.stop).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["resume", "worklet"])(
+    "releases the microphone without waiting for pending %s",
+    async (stage) => {
+      const browser = installBrowser();
+      let finish!: () => void;
+      const pending = new Promise<void>((resolve) => {
+        finish = resolve;
+      });
+      if (stage === "worklet") FakeContext.addModule = () => pending;
+      else
+        vi.stubGlobal(
+          "AudioContext",
+          class extends FakeContext {
+            override state = "suspended";
+            override resume = () => pending;
+          },
+        );
+      const controller = new AbortController();
+      const onError = vi.fn();
+      const opening = openMicrophone({
+        sampleRate: 16000,
+        onChunk: () => {},
+        signal: controller.signal,
+      }).catch(onError);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      const context = FakeContext.instances[0]!;
+      const reason = new Error("cancelled");
+      controller.abort(reason);
+      try {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        expect(onError).toHaveBeenCalledWith(reason);
+        expect(browser.track.stop).toHaveBeenCalledTimes(1);
+        expect(context.state).toBe("closed");
+      } finally {
+        finish();
+        await opening;
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+      expect(FakeWorklet.instances).toHaveLength(0);
+      expect(context.createScriptProcessor).not.toHaveBeenCalled();
+      expect(context.close).toHaveBeenCalledTimes(1);
+      if (stage === "worklet")
+        expect(browser.revokeObjectURL).toHaveBeenCalledWith("blob:worklet");
+    },
+  );
 });
 
 describe("playback", () => {
@@ -577,6 +754,36 @@ describe("playback", () => {
     await player.close();
     expect(context.sources[0]?.stop).toHaveBeenCalled();
     expect(context.close).toHaveBeenCalled();
+  });
+
+  it("shares pending playback cleanup across repeated close calls", async () => {
+    const { player, context } = setup();
+    player.enqueue(chunk(2400));
+    let finishClose!: () => void;
+    context.close.mockImplementation(() => {
+      if (context.state === "closed")
+        return Promise.reject(
+          new DOMException("Already closed", "InvalidStateError"),
+        );
+      context.state = "closed";
+      return new Promise<void>((resolve) => {
+        finishClose = resolve;
+      });
+    });
+    const settled = vi.fn();
+    const first = player.close().then(settled);
+    const second = player.close().then(settled);
+    const both = Promise.allSettled([first, second]);
+    await Promise.resolve();
+    expect(settled).not.toHaveBeenCalled();
+    finishClose();
+    expect(await both).toEqual([
+      { status: "fulfilled", value: undefined },
+      { status: "fulfilled", value: undefined },
+    ]);
+    await expect(player.close()).resolves.toBeUndefined();
+    expect(context.close).toHaveBeenCalledTimes(1);
+    expect(context.sources[0]?.stop).toHaveBeenCalledTimes(1);
   });
 
   it("handles a pending resume rejected when playback closes", async () => {
