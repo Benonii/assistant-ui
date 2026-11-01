@@ -66,6 +66,7 @@ export class GeminiLiveVoiceAdapter implements RealtimeVoiceAdapter {
       let ready = false;
       let generating = false;
       let assistantText = "";
+      let userText = "";
       let volumeTimer: ReturnType<typeof setInterval> | undefined;
       let connectionTimer: ReturnType<typeof setTimeout> | undefined;
       let pendingText:
@@ -121,6 +122,13 @@ export class GeminiLiveVoiceAdapter implements RealtimeVoiceAdapter {
         socket.send(JSON.stringify(message));
       };
 
+      const flushUser = () => {
+        if (!userText) return;
+        const text = userText;
+        userText = "";
+        session.emitTranscript({ role: "user", text, isFinal: true });
+      };
+
       const emitAssistant = (isFinal: boolean) => {
         if (!assistantText) return;
         session.emitTranscript({
@@ -133,6 +141,7 @@ export class GeminiLiveVoiceAdapter implements RealtimeVoiceAdapter {
 
       const finishTurn = () => {
         generating = false;
+        flushUser();
         emitAssistant(true);
         if (pendingText) pendingText.awaitingInterrupt = false;
       };
@@ -140,9 +149,9 @@ export class GeminiLiveVoiceAdapter implements RealtimeVoiceAdapter {
       const handleContent = (content: Record<string, unknown>) => {
         const parts = asRecord(content.modelTurn)?.parts;
         const output = asRecord(content.outputTranscription)?.text;
-        const input = asRecord(content.inputTranscription)?.text;
-        if (typeof input === "string" && input)
-          session.emitTranscript({ role: "user", text: input, isFinal: true });
+        const input = asRecord(content.inputTranscription);
+        if (typeof input?.text === "string") userText += input.text;
+        if (input?.finished === true) flushUser();
         if (content.interrupted === true) {
           player?.clear();
           finishTurn();
@@ -150,6 +159,7 @@ export class GeminiLiveVoiceAdapter implements RealtimeVoiceAdapter {
         }
         if (Array.isArray(parts) || typeof output === "string") {
           generating = true;
+          flushUser();
           if (Array.isArray(parts))
             for (const part of parts) {
               const data = asRecord(asRecord(part)?.inlineData)?.data;
@@ -204,6 +214,7 @@ export class GeminiLiveVoiceAdapter implements RealtimeVoiceAdapter {
           (content.modelTurn !== undefined ||
             content.outputTranscription !== undefined)
         ) {
+          flushUser();
           settleText();
           setTimeout(() => {
             if (!closed) handleContent(content);

@@ -216,7 +216,8 @@ describe("GeminiLiveVoiceAdapter", () => {
     socket.emit({
       serverContent: { interimInputTranscription: { text: "Hel" } },
     });
-    socket.emit({ serverContent: { inputTranscription: { text: "Hello" } } });
+    socket.emit({ serverContent: { inputTranscription: { text: "Hel" } } });
+    socket.emit({ serverContent: { inputTranscription: { text: "lo" } } });
     socket.emit({ serverContent: { outputTranscription: { text: "Good " } } });
     socket.emit({
       serverContent: { outputTranscription: { text: "morning" } },
@@ -231,6 +232,65 @@ describe("GeminiLiveVoiceAdapter", () => {
       { role: "assistant", text: "Good morning", isFinal: true },
       { role: "assistant", text: "Next", isFinal: false },
     ]);
+  });
+
+  it("joins streamed input transcription into one user message per turn", async () => {
+    const { session, socket } = await connected();
+    const onTranscript = vi.fn();
+    session.onTranscript(onTranscript);
+    const frames = [
+      { serverContent: { inputTranscription: { text: "What's" } } },
+      { serverContent: { inputTranscription: { text: " the weather" } } },
+      { serverContent: { inputTranscription: { text: " in Paris?" } } },
+    ];
+    for (const frame of frames) socket.emit(frame);
+    expect(onTranscript).not.toHaveBeenCalled();
+    socket.emit({
+      serverContent: {
+        modelTurn: { parts: [{ inlineData: { data: "AQID" } }] },
+      },
+    });
+    socket.emit({
+      serverContent: { inputTranscription: { text: " Thanks." } },
+    });
+    socket.emit({ serverContent: { outputTranscription: { text: "Sunny" } } });
+    socket.emit({ serverContent: { turnComplete: true } });
+    expect(onTranscript.mock.calls.map(([item]) => item)).toEqual([
+      { role: "user", text: "What's the weather in Paris?", isFinal: true },
+      { role: "user", text: " Thanks.", isFinal: true },
+      { role: "assistant", text: "Sunny", isFinal: false },
+      { role: "assistant", text: "Sunny", isFinal: true },
+    ]);
+  });
+
+  it("flushes input transcription when the server marks it finished or the turn ends", async () => {
+    const { session, socket } = await connected();
+    const onTranscript = vi.fn();
+    session.onTranscript(onTranscript);
+    socket.emit({ serverContent: { inputTranscription: { text: "Stop" } } });
+    socket.emit({
+      serverContent: { inputTranscription: { text: " now", finished: true } },
+    });
+    expect(onTranscript).toHaveBeenLastCalledWith({
+      role: "user",
+      text: "Stop now",
+      isFinal: true,
+    });
+    socket.emit({ serverContent: { inputTranscription: { text: "Bye" } } });
+    socket.emit({ serverContent: { turnComplete: true } });
+    expect(onTranscript).toHaveBeenLastCalledWith({
+      role: "user",
+      text: "Bye",
+      isFinal: true,
+    });
+    socket.emit({ serverContent: { inputTranscription: { text: "Wait" } } });
+    socket.emit({ serverContent: { interrupted: true } });
+    expect(onTranscript).toHaveBeenLastCalledWith({
+      role: "user",
+      text: "Wait",
+      isFinal: true,
+    });
+    expect(onTranscript).toHaveBeenCalledTimes(3);
   });
 
   it("clears playback and finalizes the reply when the user interrupts", async () => {
@@ -433,7 +493,9 @@ describe("GeminiLiveVoiceAdapter", () => {
     socket.onmessage?.({
       data: new TextEncoder().encode(
         JSON.stringify({
-          serverContent: { inputTranscription: { text: "One" } },
+          serverContent: {
+            inputTranscription: { text: "One", finished: true },
+          },
         }),
       ).buffer,
     });
