@@ -124,7 +124,7 @@ export const openMicrophone = async (options: {
         options.onChunk(encodePcm16(samples));
     };
 
-    let node: AudioNode;
+    let node: AudioNode | undefined;
     let detach = () => {};
     if (context.audioWorklet) {
       const url = URL.createObjectURL(
@@ -132,19 +132,23 @@ export const openMicrophone = async (options: {
       );
       try {
         await context.audioWorklet.addModule(url);
+        throwIfAborted();
+        const worklet = new AudioWorkletNode(context, "pcm-capture", {
+          processorOptions: { targetRate: options.sampleRate },
+        });
+        worklet.port.onmessage = (event) => push(event.data as Float32Array);
+        detach = () => {
+          worklet.port.onmessage = null;
+        };
+        node = worklet;
+      } catch {
+        // A CSP can block blob worklets even when AudioWorklet is available.
+        throwIfAborted();
       } finally {
         URL.revokeObjectURL(url);
       }
-      throwIfAborted();
-      const worklet = new AudioWorkletNode(context, "pcm-capture", {
-        processorOptions: { targetRate: options.sampleRate },
-      });
-      worklet.port.onmessage = (event) => push(event.data as Float32Array);
-      detach = () => {
-        worklet.port.onmessage = null;
-      };
-      node = worklet;
-    } else {
+    }
+    if (!node) {
       const resample = createResampler(context.sampleRate / options.sampleRate);
       const processor = context.createScriptProcessor(2048, 1, 1);
       processor.onaudioprocess = (event) =>
@@ -232,7 +236,7 @@ export const createPcmPlayer = (options: {
         if (sources.size === 0) scheduleIdle();
       };
       clearTimeout(idleTimer);
-      if (context.state === "suspended") void context.resume();
+      if (context.state === "suspended") void context.resume().catch(() => {});
     },
     clear: () => {
       clearTimeout(idleTimer);

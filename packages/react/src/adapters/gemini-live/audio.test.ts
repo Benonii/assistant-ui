@@ -71,7 +71,7 @@ class FakeContext {
     this.sources.push(source);
     return source;
   });
-  resume = vi.fn(async () => {});
+  resume: () => Promise<void> = vi.fn(async () => {});
   close = vi.fn(async () => {});
 }
 
@@ -316,45 +316,92 @@ describe("microphone", () => {
       expect(Math.abs(value - (k * 3) / 8192)).toBeLessThan(1 / 16384);
   });
 
-  it("stops the tracks and closes the context when worklet setup fails", async () => {
+  it("captures with the fallback when the worklet module is blocked", async () => {
+    FakeContext.addModule = async () => {
+      throw new DOMException("Blocked by CSP", "SecurityError");
+    };
+    const browser = installBrowser();
+    const onChunk = vi.fn();
+    const microphone = await openMicrophone({ sampleRate: 16000, onChunk });
+    const context = FakeContext.instances[0]!;
+    const handler = context.processor.onaudioprocess!;
+    const event = {
+      inputBuffer: {
+        getChannelData: () => Float32Array.from([0, 0, 0, 0.5, 0, 0]),
+      },
+    };
+    handler(event);
+    expect(onChunk).toHaveBeenCalledWith("AAD/Pw==");
+    expect(browser.track.stop).not.toHaveBeenCalled();
+    expect(browser.revokeObjectURL).toHaveBeenCalledWith("blob:worklet");
+    expect(FakeWorklet.instances).toHaveLength(0);
+    microphone.setMuted(true);
+    handler(event);
+    expect(onChunk).toHaveBeenCalledTimes(1);
+    microphone.setMuted(false);
+    await microphone.close();
+    handler(event);
+    expect(onChunk).toHaveBeenCalledTimes(1);
+    expect(context.processor.onaudioprocess).toBeNull();
+    expect(browser.track.stop).toHaveBeenCalled();
+    expect(context.close).toHaveBeenCalled();
+  });
+
+  it("stops the tracks and closes the context when both capture paths fail", async () => {
     FakeContext.addModule = async () => {
       throw new Error("bad module");
     };
     const browser = installBrowser();
+    vi.stubGlobal(
+      "AudioContext",
+      class extends FakeContext {
+        override createScriptProcessor = vi.fn(() => {
+          throw new Error("processor unavailable");
+        });
+      },
+    );
     await expect(
       openMicrophone({ sampleRate: 16000, onChunk: () => {} }),
-    ).rejects.toThrow("bad module");
+    ).rejects.toThrow("processor unavailable");
     expect(browser.track.stop).toHaveBeenCalled();
     expect(FakeContext.instances[0]?.close).toHaveBeenCalled();
     expect(browser.revokeObjectURL).toHaveBeenCalledWith("blob:worklet");
     expect(FakeWorklet.instances).toHaveLength(0);
   });
 
-  it("stops the tracks and closes the context when aborted during setup", async () => {
-    let finishModule!: () => void;
-    FakeContext.addModule = () =>
-      new Promise<void>((resolve) => {
-        finishModule = resolve;
+  it.each([false, true])(
+    "cleans up an aborted setup when the module rejects: %s",
+    async (rejectModule) => {
+      let finishModule!: () => void;
+      FakeContext.addModule = () =>
+        new Promise<void>((resolve, reject) => {
+          finishModule = rejectModule
+            ? () => reject(new Error("blocked module"))
+            : resolve;
+        });
+      const browser = installBrowser();
+      const controller = new AbortController();
+      const opening = openMicrophone({
+        sampleRate: 16000,
+        onChunk: () => {},
+        signal: controller.signal,
       });
-    const browser = installBrowser();
-    const controller = new AbortController();
-    const opening = openMicrophone({
-      sampleRate: 16000,
-      onChunk: () => {},
-      signal: controller.signal,
-    });
-    await vi.waitFor(() =>
+      await vi.waitFor(() =>
+        expect(
+          FakeContext.instances[0]?.audioWorklet?.addModule,
+        ).toHaveBeenCalled(),
+      );
+      controller.abort(new Error("cancelled"));
+      finishModule();
+      await expect(opening).rejects.toThrow("cancelled");
+      expect(browser.track.stop).toHaveBeenCalled();
+      expect(FakeContext.instances[0]?.close).toHaveBeenCalled();
       expect(
-        FakeContext.instances[0]?.audioWorklet?.addModule,
-      ).toHaveBeenCalled(),
-    );
-    controller.abort(new Error("cancelled"));
-    finishModule();
-    await expect(opening).rejects.toThrow("cancelled");
-    expect(browser.track.stop).toHaveBeenCalled();
-    expect(FakeContext.instances[0]?.close).toHaveBeenCalled();
-    expect(FakeWorklet.instances).toHaveLength(0);
-  });
+        FakeContext.instances[0]?.createScriptProcessor,
+      ).not.toHaveBeenCalled();
+      expect(FakeWorklet.instances).toHaveLength(0);
+    },
+  );
 
   it("mutes by disabling the track and dropping chunks", async () => {
     const browser = installBrowser();
@@ -530,6 +577,34 @@ describe("playback", () => {
     await player.close();
     expect(context.sources[0]?.stop).toHaveBeenCalled();
     expect(context.close).toHaveBeenCalled();
+  });
+
+  it("handles a pending resume rejected when playback closes", async () => {
+    vi.useFakeTimers();
+    try {
+      const onIdle = vi.fn();
+      const { player, context } = setup(onIdle);
+      let rejectResume!: (reason: unknown) => void;
+      const resume = new Promise<void>((_resolve, reject) => {
+        rejectResume = reject;
+      });
+      context.state = "suspended";
+      context.resume = () => resume;
+      context.close.mockImplementation(async () => {
+        context.state = "closed";
+        rejectResume(
+          new DOMException("AudioContext closed", "InvalidStateError"),
+        );
+      });
+      player.enqueue(chunk(2400));
+      await player.close();
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(context.state).toBe("closed");
+      expect(player.isPlaying()).toBe(false);
+      expect(onIdle).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("does not report idle for a source that ends after close", async () => {
