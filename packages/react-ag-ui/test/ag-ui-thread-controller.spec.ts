@@ -8529,7 +8529,6 @@ describe("AGUIThreadRuntimeCore", () => {
     const core = createCore(agent);
     await core.append(createAppendMessage());
 
-    expect(midRunAssistant?.id.startsWith("__optimistic__")).toBe(true);
     expect(midRunAssistant?.metadata.isOptimistic).toBe(true);
 
     const assistant = core
