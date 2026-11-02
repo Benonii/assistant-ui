@@ -58,7 +58,7 @@ const Thread = () => (
   />
 );
 
-const continuations: [string, (send: Send) => void][] = [
+const continuations: [string, (send: Send, userId: string) => void][] = [
   [
     "text with its own message id",
     (send) => {
@@ -105,6 +105,23 @@ const continuations: [string, (send: Send) => void][] = [
     },
   ],
   ["nothing that carries a message id", () => {}],
+  [
+    "a messages snapshot that names the assistant message",
+    (send, userId) => {
+      send("onMessagesSnapshotEvent", {
+        type: "MESSAGES_SNAPSHOT",
+        messages: [
+          { id: userId, role: "user", content: "why?" },
+          {
+            id: "reasoning-1",
+            role: "reasoning",
+            content: "Considering the question.",
+          },
+          { id: "assistant-1", role: "assistant", content: "Because." },
+        ],
+      });
+    },
+  ],
 ];
 
 afterEach(() => {
@@ -130,6 +147,7 @@ describe("useAgUiRuntime message identity (repro #10229)", () => {
         });
       });
       await waitFor(() => expect(runAgent).toHaveBeenCalledTimes(1));
+      const userId = result.current.thread.getState().messages[0]!.id;
 
       act(() => {
         send("onRunStartedEvent", { type: "RUN_STARTED", runId: "run-1" });
@@ -161,7 +179,7 @@ describe("useAgUiRuntime message identity (repro #10229)", () => {
           type: "REASONING_END",
           messageId: "reasoning-1",
         });
-        continueRun(send);
+        continueRun(send, userId);
         send("onRunFinishedEvent", { type: "RUN_FINISHED", runId: "run-1" });
         send("onRunFinalized", {});
         finish();
