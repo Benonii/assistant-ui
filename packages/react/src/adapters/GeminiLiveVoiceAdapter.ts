@@ -67,6 +67,7 @@ export class GeminiLiveVoiceAdapter implements RealtimeVoiceAdapter {
       let generating = false;
       let assistantText = "";
       let userText = "";
+      let deferred: Record<string, unknown>[] | undefined;
       let volumeTimer: ReturnType<typeof setInterval> | undefined;
       let connectionTimer: ReturnType<typeof setTimeout> | undefined;
       let pendingText:
@@ -93,6 +94,7 @@ export class GeminiLiveVoiceAdapter implements RealtimeVoiceAdapter {
         controller.abort();
         clearInterval(volumeTimer);
         clearTimeout(connectionTimer);
+        deferred = undefined;
         settleText(
           new Error(
             "Gemini Live session disconnected before accepting the message.",
@@ -139,6 +141,12 @@ export class GeminiLiveVoiceAdapter implements RealtimeVoiceAdapter {
         if (isFinal) assistantText = "";
       };
 
+      const stopPlayback = () => {
+        if (!player?.isPlaying()) return;
+        player.clear();
+        session.emitMode("listening");
+      };
+
       const finishTurn = () => {
         generating = false;
         flushUser();
@@ -153,7 +161,7 @@ export class GeminiLiveVoiceAdapter implements RealtimeVoiceAdapter {
         if (typeof input?.text === "string") userText += input.text;
         if (input?.finished === true) flushUser();
         if (content.interrupted === true) {
-          player?.clear();
+          stopPlayback();
           finishTurn();
           return;
         }
@@ -208,6 +216,10 @@ export class GeminiLiveVoiceAdapter implements RealtimeVoiceAdapter {
             console.warn("Gemini Live session is closing.", goAway.timeLeft);
           return;
         }
+        if (deferred) {
+          deferred.push(content);
+          return;
+        }
         if (
           pendingText &&
           !pendingText.awaitingInterrupt &&
@@ -216,8 +228,11 @@ export class GeminiLiveVoiceAdapter implements RealtimeVoiceAdapter {
         ) {
           flushUser();
           settleText();
+          const queue = (deferred = [content]);
           setTimeout(() => {
-            if (!closed) handleContent(content);
+            deferred = undefined;
+            if (closed) return;
+            for (const item of queue) handleContent(item);
           }, 0);
           return;
         }
@@ -254,13 +269,13 @@ export class GeminiLiveVoiceAdapter implements RealtimeVoiceAdapter {
           }
           if (message) handleMessage(message);
         };
-        socket.onclose = () => {
+        socket.onclose = ({ code, reason }) => {
           if (ready) end("finished");
           else
             end(
               "error",
               new Error(
-                "Gemini Live connection closed before setup completed.",
+                `Gemini Live connection closed before setup completed (${code}${reason ? `: ${reason}` : ""}).`,
               ),
             );
         };
@@ -331,6 +346,7 @@ export class GeminiLiveVoiceAdapter implements RealtimeVoiceAdapter {
                 turnComplete: true,
               },
             });
+            stopPlayback();
             pendingText = {
               awaitingInterrupt: generating,
               resolve,

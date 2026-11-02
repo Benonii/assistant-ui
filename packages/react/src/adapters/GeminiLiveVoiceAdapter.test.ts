@@ -49,13 +49,13 @@ class Socket {
   readyState = 0;
   binaryType = "blob";
   onopen: (() => void) | null = null;
-  onclose: (() => void) | null = null;
+  onclose: ((event: { code: number; reason: string }) => void) | null = null;
   onerror: (() => void) | null = null;
   onmessage: ((event: { data: unknown }) => void) | null = null;
   send = vi.fn<(data: string) => void>();
   close = vi.fn(() => {
     this.readyState = 3;
-    this.onclose?.();
+    this.onclose?.({ code: 1000, reason: "" });
   });
   url: string;
   constructor(url: string) {
@@ -297,9 +297,13 @@ describe("GeminiLiveVoiceAdapter", () => {
     const { session, socket } = await connected();
     const onTranscript = vi.fn();
     session.onTranscript(onTranscript);
+    const onMode = vi.fn();
+    session.onModeChange(onMode);
+    audio.player.isPlaying.mockReturnValue(true);
     socket.emit({ serverContent: { outputTranscription: { text: "Let me" } } });
     socket.emit({ serverContent: { interrupted: true } });
     expect(audio.player.clear).toHaveBeenCalledOnce();
+    expect(onMode).toHaveBeenLastCalledWith("listening");
     expect(onTranscript).toHaveBeenLastCalledWith({
       role: "assistant",
       text: "Let me",
@@ -382,9 +386,15 @@ describe("GeminiLiveVoiceAdapter", () => {
     socket.emit({
       serverContent: { outputTranscription: { text: "Previous" } },
     });
+    audio.player.isPlaying.mockReturnValue(true);
+    const onMode = vi.fn();
+    session.onModeChange(onMode);
     const accepted = vi.fn();
     const sent = Promise.resolve(session.sendText!("Change the topic"));
     void sent.then(accepted);
+    expect(audio.player.clear).toHaveBeenCalledOnce();
+    expect(onMode).toHaveBeenLastCalledWith("listening");
+    audio.player.isPlaying.mockReturnValue(false);
     socket.emit({ serverContent: { outputTranscription: { text: " reply" } } });
     await Promise.resolve();
     expect(accepted).not.toHaveBeenCalled();
@@ -405,6 +415,37 @@ describe("GeminiLiveVoiceAdapter", () => {
       role: "assistant",
       text: "New",
       isFinal: false,
+    });
+  });
+
+  it("keeps frames that arrive during the deferred first chunk in order", async () => {
+    const { session, socket } = await connected();
+    const onTranscript = vi.fn();
+    session.onTranscript(onTranscript);
+    const sent = session.sendText!("Hello");
+    socket.emit({ serverContent: { outputTranscription: { text: "One" } } });
+    socket.emit({ serverContent: { outputTranscription: { text: " two" } } });
+    socket.emit({ serverContent: { turnComplete: true } });
+    await sent;
+    expect(onTranscript).not.toHaveBeenCalled();
+    await flush();
+    expect(onTranscript.mock.calls.map(([item]) => item)).toEqual([
+      { role: "assistant", text: "One", isFinal: false },
+      { role: "assistant", text: "One two", isFinal: false },
+      { role: "assistant", text: "One two", isFinal: true },
+    ]);
+  });
+
+  it("reports the close code when the socket closes before setup", async () => {
+    const { session, socket } = await opened();
+    socket.readyState = 3;
+    socket.onclose?.({ code: 1008, reason: "invalid token" });
+    expect(session.status).toMatchObject({
+      type: "ended",
+      reason: "error",
+      error: expect.objectContaining({
+        message: expect.stringContaining("1008: invalid token"),
+      }),
     });
   });
 
