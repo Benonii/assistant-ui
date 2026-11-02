@@ -190,6 +190,7 @@ describe("useAgUiRuntime message identity (repro #10229)", () => {
       );
       expect(details.isConnected).toBe(true);
       expect(details.open).toBe(true);
+      expect(screen.getAllByTestId("reasoning")).toHaveLength(1);
     },
   );
 });
