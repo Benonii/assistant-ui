@@ -91,10 +91,6 @@ type RunAgentWithRunOptions = (
   options: { signal: AbortSignal },
 ) => Promise<RunAgentResult>;
 
-const optimisticPrefix = "__optimistic__";
-const generateOptimisticId = () => `${optimisticPrefix}${generateId()}`;
-const isOptimisticId = (id: string) => id.startsWith(optimisticPrefix);
-
 const isResolvedToolCall = (
   part: ThreadAssistantMessage["content"][number],
 ): boolean =>
@@ -301,6 +297,7 @@ export class AgUiThreadController {
   private readonly reportedErrors = new WeakSet<object>();
 
   private runtime: AssistantRuntime | undefined;
+  private readonly optimisticIds = new Set<string>();
   private readonly session = createMessageRepositorySession({
     decorateExport: (exported, repository) => {
       let parentId: string | null = null;
@@ -2524,8 +2521,10 @@ export class AgUiThreadController {
 
   private insertAssistantPlaceholder(
     parentId: string | null,
-    id: string = generateOptimisticId(),
+    cachedId?: string,
   ): string {
+    const id = cachedId ?? generateId();
+    if (cachedId === undefined) this.optimisticIds.add(id);
     const assistant: ThreadAssistantMessage = {
       id,
       role: "assistant",
@@ -2537,7 +2536,7 @@ export class AgUiThreadController {
         unstable_annotations: [],
         unstable_data: [],
         steps: [],
-        isOptimistic: isOptimisticId(id),
+        isOptimistic: this.optimisticIds.has(id),
         custom: {},
       },
     };
@@ -2549,6 +2548,7 @@ export class AgUiThreadController {
 
   private reassignAssistantId(oldId: string, newId: string): boolean {
     if (oldId === newId) return true;
+    this.optimisticIds.delete(oldId);
     const oldItem = this.session.tryGetMessage(oldId);
     if (!oldItem) return false;
 
@@ -2728,16 +2728,16 @@ export class AgUiThreadController {
     });
     if (!touched) return messageId;
 
-    let resolvedMessageId = messageId;
+    const resolvedMessageId = messageId;
     const isSettled =
       latestStatus !== undefined && latestStatus.type !== "running";
-    if (isSettled && isOptimisticId(messageId)) {
-      const stableId = generateId();
-      this.reassignAssistantId(messageId, stableId);
-      resolvedMessageId = stableId;
-    } else {
-      this.publishUpdate();
+    if (isSettled && this.optimisticIds.delete(messageId)) {
+      this.session.updateMessage(messageId, (message) => {
+        const { isOptimistic: _, ...metadata } = message.metadata;
+        return { ...message, metadata } as ThreadMessage;
+      });
     }
+    this.publishUpdate();
     if (this.isPersistableStatus(latestStatus)) {
       this.persistAssistantHistory(resolvedMessageId);
     }
