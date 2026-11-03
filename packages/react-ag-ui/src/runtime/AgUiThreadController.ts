@@ -3032,7 +3032,16 @@ export class AgUiThreadController {
           reconcileSnapshot,
         );
         const headId = this.session.headId;
-        if (hasActiveText && headId !== previousHeadId) {
+        // A snapshot that drops the in-flight assistant (it carries this
+        // turn's assistant under the server id) hands the run over to that
+        // message, even before any text streamed.
+        const droppedActiveAssistant =
+          activeAssistant?.role === "assistant" &&
+          !this.session.hasMessage(activeAssistant.id);
+        if (
+          (hasActiveText || droppedActiveAssistant) &&
+          headId !== previousHeadId
+        ) {
           const head =
             headId === null
               ? undefined
