@@ -225,3 +225,56 @@ describe("useDataStreamRuntime tool approvals", () => {
     },
   );
 });
+
+describe("same-name frontend tool (repro #10267)", () => {
+  it("does not run the frontend execute before the approval is answered", async () => {
+    const { fetchMock } = startServer();
+    const runtime = await mountRuntime();
+    const frontendExecute = vi.fn(async () => ({ deleted: "by frontend" }));
+    runtime.registerModelContextProvider({
+      getModelContext: () => ({
+        tools: {
+          delete_file: {
+            parameters: {
+              type: "object",
+              properties: { path: { type: "string" } },
+              required: ["path"],
+            },
+            execute: frontendExecute,
+          },
+        },
+      }),
+    });
+
+    await act(async () => {
+      await runtime.thread.append({
+        role: "user",
+        content: [{ type: "text", text: "Delete /tmp/a.txt" }],
+      });
+    });
+    const toolPart = runtime.thread
+      .getMessageByIndex(1)
+      .getMessagePartByToolCallId("call_1");
+    await waitFor(() => {
+      const state = toolPart.getState();
+      expect(state.type === "tool-call" && state.approval?.id).toEqual(
+        expect.any(String),
+      );
+    });
+
+    expect(frontendExecute).not.toHaveBeenCalled();
+    expect(runtime.thread.getState().messages.at(-1)?.status).toEqual({
+      type: "requires-action",
+      reason: "tool-calls",
+    });
+
+    await act(async () => {
+      await toolPart.respondToToolApproval({
+        approved: false,
+        reason: "not now",
+      });
+    });
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    expect(frontendExecute).not.toHaveBeenCalled();
+  });
+});
