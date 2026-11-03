@@ -95,6 +95,7 @@ export class ToolExecutionStream extends PipeableTransformStream<
     const toolCallIdsWithBackendResult = new Set<symbol>();
     const executionIdsByPath = new Map<string, symbol>();
     let nextPartIndex = 0;
+    let heldExecution: { path: string; dispatch: () => void } | undefined;
 
     super((readable) => {
       const transform = new TransformStream<
@@ -102,6 +103,15 @@ export class ToolExecutionStream extends PipeableTransformStream<
         AssistantStreamChunk
       >({
         async transform(chunk, controller) {
+          if (heldExecution) {
+            const held = heldExecution;
+            heldExecution = undefined;
+            const gated =
+              chunk.type === "tool-call-approval" &&
+              pathKey(chunk.path) === held.path;
+            if (!gated) held.dispatch();
+          }
+
           const executionId = executionIdsByPath.get(pathKey(chunk.path));
 
           // forward everything
@@ -200,107 +210,113 @@ export class ToolExecutionStream extends PipeableTransformStream<
               // execute the frontend tool, or enqueue a second result.
               if (toolCallIdsWithBackendResult.has(executionId!)) break;
 
-              let isExecuting = false;
-              const promise = withPromiseOrValue(
-                () => {
-                  let args: ReadonlyJSONObject;
-                  try {
-                    args = sjson.parse(
-                      streamController.argsText,
-                    ) as ReadonlyJSONObject;
-                  } catch (e) {
-                    throw new Error(
-                      `Function parameter parsing failed. ${JSON.stringify((e as Error).message)}`,
-                    );
-                  }
+              const dispatch = () => {
+                let isExecuting = false;
+                const promise = withPromiseOrValue(
+                  () => {
+                    let args: ReadonlyJSONObject;
+                    try {
+                      args = sjson.parse(
+                        streamController.argsText,
+                      ) as ReadonlyJSONObject;
+                    } catch (e) {
+                      throw new Error(
+                        `Function parameter parsing failed. ${JSON.stringify((e as Error).message)}`,
+                      );
+                    }
 
-                  const executeResult = internalOptions.execute({
-                    toolCallId,
-                    toolName,
-                    args,
-                    executionId: executionId!,
-                  });
-
-                  // Only mark as executing if the tool has frontend execution
-                  if (executeResult !== undefined) {
-                    isExecuting = true;
-                    invokeExecutionCallback(
-                      "onExecutionStart",
-                      internalOptions.onExecutionStart,
+                    const executeResult = internalOptions.execute({
                       toolCallId,
                       toolName,
-                      executionId!,
+                      args,
+                      executionId: executionId!,
+                    });
+
+                    // Only mark as executing if the tool has frontend execution
+                    if (executeResult !== undefined) {
+                      isExecuting = true;
+                      invokeExecutionCallback(
+                        "onExecutionStart",
+                        internalOptions.onExecutionStart,
+                        toolCallId,
+                        toolName,
+                        executionId!,
+                      );
+                    }
+
+                    return executeResult;
+                  },
+                  (c) => {
+                    if (isExecuting) {
+                      invokeExecutionCallback(
+                        "onExecutionEnd",
+                        internalOptions.onExecutionEnd,
+                        toolCallId,
+                        toolName,
+                        executionId!,
+                      );
+                    }
+
+                    if (c === undefined) return;
+
+                    const result = new ToolResponse({
+                      artifact: c.artifact,
+                      result: c.result,
+                      isError: c.isError,
+                      messages: c.messages,
+                      modelContent: c.modelContent,
+                    });
+                    streamController.setResponse(result);
+                    enqueueIfOpen(
+                      controller,
+                      withExecutionId(
+                        {
+                          type: "result",
+                          path: chunk.path,
+                          ...result,
+                        },
+                        executionId!,
+                      ),
                     );
-                  }
+                  },
+                  (e) => {
+                    if (isExecuting) {
+                      invokeExecutionCallback(
+                        "onExecutionEnd",
+                        internalOptions.onExecutionEnd,
+                        toolCallId,
+                        toolName,
+                        executionId!,
+                      );
+                    }
 
-                  return executeResult;
-                },
-                (c) => {
-                  if (isExecuting) {
-                    invokeExecutionCallback(
-                      "onExecutionEnd",
-                      internalOptions.onExecutionEnd,
-                      toolCallId,
-                      toolName,
-                      executionId!,
+                    const result = new ToolResponse({
+                      result: String(e),
+                      isError: true,
+                    });
+
+                    streamController.setResponse(result);
+                    enqueueIfOpen(
+                      controller,
+                      withExecutionId(
+                        {
+                          type: "result",
+                          path: chunk.path,
+                          ...result,
+                        },
+                        executionId!,
+                      ),
                     );
-                  }
-
-                  if (c === undefined) return;
-
-                  const result = new ToolResponse({
-                    artifact: c.artifact,
-                    result: c.result,
-                    isError: c.isError,
-                    messages: c.messages,
-                    modelContent: c.modelContent,
-                  });
-                  streamController.setResponse(result);
-                  enqueueIfOpen(
-                    controller,
-                    withExecutionId(
-                      {
-                        type: "result",
-                        path: chunk.path,
-                        ...result,
-                      },
-                      executionId!,
-                    ),
-                  );
-                },
-                (e) => {
-                  if (isExecuting) {
-                    invokeExecutionCallback(
-                      "onExecutionEnd",
-                      internalOptions.onExecutionEnd,
-                      toolCallId,
-                      toolName,
-                      executionId!,
-                    );
-                  }
-
-                  const result = new ToolResponse({
-                    result: String(e),
-                    isError: true,
-                  });
-
-                  streamController.setResponse(result);
-                  enqueueIfOpen(
-                    controller,
-                    withExecutionId(
-                      {
-                        type: "result",
-                        path: chunk.path,
-                        ...result,
-                      },
-                      executionId!,
-                    ),
-                  );
-                },
-              );
-              if (promise) {
-                toolCallPromises.set(executionId!, promise);
-              }
+                  },
+                );
+                if (promise) {
+                  toolCallPromises.set(executionId!, promise);
+                }
+              };
+              // A server may gate this call: the AI SDK sends the approval
+              // request right after the call's input. Wait one chunk before
+              // running the frontend execute so an approval can stop it.
+              heldExecution = { path: pathKey(chunk.path), dispatch };
               break;
             }
 
@@ -332,6 +348,8 @@ export class ToolExecutionStream extends PipeableTransformStream<
           }
         },
         async flush() {
+          heldExecution?.dispatch();
+          heldExecution = undefined;
           await Promise.all(toolCallPromises.values());
         },
       });
