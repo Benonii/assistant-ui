@@ -226,7 +226,7 @@ describe("useDataStreamRuntime tool approvals", () => {
   );
 });
 
-describe("same-name frontend tool (repro #10267)", () => {
+describe("useDataStreamRuntime same-name frontend tool", () => {
   it("does not run the frontend execute before the approval is answered", async () => {
     const { fetchMock } = startServer();
     const runtime = await mountRuntime();

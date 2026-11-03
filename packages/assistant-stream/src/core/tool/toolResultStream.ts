@@ -30,6 +30,7 @@ type InternalToolResultStreamOptions = Omit<
   onExecutionEnd?:
     | ((toolCallId: string, toolName: string, executionId: symbol) => void)
     | undefined;
+  holdExecuteForApproval?: boolean | undefined;
 };
 
 const isStandardSchemaV1 = (
@@ -337,6 +338,7 @@ export function toolResultStream(
       ),
     onExecutionStart: internalOptions?.onExecutionStart,
     onExecutionEnd: internalOptions?.onExecutionEnd,
+    holdExecuteForApproval: internalOptions?.holdExecuteForApproval,
   };
   return new ToolExecutionStream(
     executionOptions as unknown as ConstructorParameters<

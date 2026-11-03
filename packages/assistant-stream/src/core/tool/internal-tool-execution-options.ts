@@ -30,4 +30,10 @@ export type InternalToolExecutionOptions = {
   onExecutionEnd?:
     | ((toolCallId: string, toolName: string, executionId: symbol) => void)
     | undefined;
+  /**
+   * Wait one chunk after a call's args finish before running `execute`, and
+   * skip it when that chunk is the call's `tool-call-approval`. Servers such
+   * as the AI SDK send the approval request right after the call's input.
+   */
+  holdExecuteForApproval?: boolean | undefined;
 };

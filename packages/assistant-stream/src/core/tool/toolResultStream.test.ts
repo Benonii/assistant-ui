@@ -1737,3 +1737,102 @@ describe("unstable_runPendingTools", () => {
     },
   );
 });
+
+describe("holdExecuteForApproval", () => {
+  const callChunks = (index: number, toolCallId: string) =>
+    [
+      {
+        type: "part-start",
+        path: [],
+        part: { type: "tool-call", toolCallId, toolName: "deleteFile" },
+      },
+      { type: "text-delta", path: [index], textDelta: "{}" },
+      { type: "tool-call-args-text-finish", path: [index] },
+    ] as AssistantStreamChunk[];
+  const approval = (index: number) =>
+    ({
+      type: "tool-call-approval",
+      path: [index],
+      approval: { id: `approval-${index}` },
+    }) as AssistantStreamChunk;
+
+  const run = async (chunks: AssistantStreamChunk[]) => {
+    const execute = vi.fn((_args: unknown, { toolCallId }) => toolCallId);
+    const input = new ReadableStream<AssistantStreamChunk>({
+      start(controller) {
+        for (const chunk of chunks) controller.enqueue(chunk);
+        controller.close();
+      },
+    });
+    const output = input.pipeThrough(
+      unstable_toolResultStream(
+        {
+          deleteFile: {
+            parameters: { type: "object", properties: {} },
+            execute,
+          },
+        },
+        new AbortController().signal,
+        async () => {},
+        { holdExecuteForApproval: true } as never,
+      ),
+    );
+    const out: AssistantStreamChunk[] = [];
+    for await (const chunk of output as unknown as AsyncIterable<AssistantStreamChunk>)
+      out.push(chunk);
+    return {
+      executed: execute.mock.calls.map(([, { toolCallId }]) => toolCallId),
+      results: out.filter((chunk) => chunk.type === "result").length,
+    };
+  };
+
+  it("skips execute when the next chunk is the call's approval", async () => {
+    expect(
+      await run([
+        ...callChunks(0, "call_1"),
+        approval(0),
+        { type: "part-finish", path: [0] },
+      ]),
+    ).toEqual({ executed: [], results: 0 });
+  });
+
+  it("runs execute on the next chunk when no approval follows", async () => {
+    expect(
+      await run([
+        ...callChunks(0, "call_1"),
+        { type: "part-finish", path: [0] },
+      ]),
+    ).toEqual({ executed: ["call_1"], results: 1 });
+  });
+
+  it("runs a held execute when the stream ends", async () => {
+    expect(await run(callChunks(0, "call_1"))).toEqual({
+      executed: ["call_1"],
+      results: 1,
+    });
+  });
+
+  it("only skips the call the approval names", async () => {
+    expect(
+      await run([
+        ...callChunks(0, "call_1"),
+        approval(0),
+        ...callChunks(1, "call_2"),
+        { type: "part-finish", path: [0] },
+        { type: "part-finish", path: [1] },
+      ]),
+    ).toEqual({ executed: ["call_2"], results: 1 });
+  });
+
+  it("does not skip a call when another call's approval follows it", async () => {
+    expect(
+      await run([
+        ...callChunks(0, "call_1"),
+        ...callChunks(1, "call_2"),
+        approval(1),
+        { type: "part-finish", path: [0] },
+        { type: "part-finish", path: [1] },
+      ]),
+    ).toEqual({ executed: ["call_1"], results: 1 });
+  });
+});

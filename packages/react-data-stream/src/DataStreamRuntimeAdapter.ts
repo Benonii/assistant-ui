@@ -16,6 +16,7 @@ import {
   toToolsJSONSchema,
   UIMessageStreamDecoder,
   unstable_toolResultStream,
+  type ToolResultStreamOptions,
 } from "assistant-stream";
 import { asAsyncIterableStream } from "assistant-stream/utils";
 import type { UseDataStreamRuntimeOptions } from "./useDataStreamRuntime";
@@ -216,11 +217,18 @@ export class DataStreamRuntimeAdapter implements ChatModelAdapter {
       const stream = result.body
         .pipeThrough(decoder)
         .pipeThrough(
-          unstable_toolResultStream(context.tools, abortSignal, () => {
-            throw new Error(
-              "Tool interrupt is not supported in data stream runtime",
-            );
-          }),
+          unstable_toolResultStream(
+            context.tools,
+            abortSignal,
+            () => {
+              throw new Error(
+                "Tool interrupt is not supported in data stream runtime",
+              );
+            },
+            // A server approval arrives right after the call's input, so a
+            // same-name frontend tool waits one chunk for it (#10267).
+            { holdExecuteForApproval: true } as ToolResultStreamOptions,
+          ),
         )
         .pipeThrough(new AssistantMessageAccumulator());
 
