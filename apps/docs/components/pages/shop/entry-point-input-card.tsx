@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, type FormEvent } from "react";
-import { AppWindowIcon, PanelRightIcon, SquareIcon } from "lucide-react";
+import { AppWindowIcon, MaximizeIcon, PanelRightIcon } from "lucide-react";
 import {
   NoteField,
   SubmitRow,
@@ -16,7 +16,7 @@ import { inputPrompt, type Checkout } from "@/lib/checkout/protocol";
 const icons = {
   modal: AppWindowIcon,
   sidebar: PanelRightIcon,
-  "full-page": SquareIcon,
+  "full-page": MaximizeIcon,
 };
 const labels = {
   modal: "Modal",
